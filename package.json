@@ -1,0 +1,30 @@
+{
+  "name": "dujiao-stock-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Dujiao-Next 库存通知：全部通过 Telegram 配置",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "tsx src/main.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/src/supervisor.js",
+    "release:bundle": "node scripts/package-release.mjs",
+    "test": "tsx --test test/*.test.ts",
+    "check": "tsc --noEmit",
+    "format": "prettier --write src test package.json tsconfig.json compose.yaml .github README.md docs"
+  },
+  "dependencies": {
+    "grammy": "^1.38.0",
+    "tar": "^7.5.22",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "prettier": "^3.9.10",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}

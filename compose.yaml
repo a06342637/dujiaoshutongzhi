@@ -1,0 +1,25 @@
+services:
+  bot:
+    image: ghcr.io/a06342637/dujiaoshutongzhi:latest
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 90s
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN:?请填写 BOT_TOKEN}
+      ADMIN_USER_ID: ${ADMIN_USER_ID:?请填写 ADMIN_USER_ID}
+    volumes:
+      - bot-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+volumes:
+  bot-data:

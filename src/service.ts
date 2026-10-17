@@ -1,0 +1,377 @@
+import { randomUUID, createHash } from 'node:crypto';
+import type { Config } from './config.js';
+import { isEnabled } from './config.js';
+import { DujiaoAdapter, FetchError } from './adapter.js';
+import { advance, emptyEngine, mergeChanges } from './engine.js';
+import { renderBoard, renderNotification, escapeHTML, validateAppearance } from './render.js';
+import type { Store } from './store.js';
+import { DeliveryError, simpleMessage, type Transport } from './telegram.js';
+import type { Batch, BoardRecord, EngineState, Product, Runtime, Scan } from './types.js';
+
+const initialRuntime = (): Runtime => ({
+  lastSuccess: 0,
+  lastAttempt: 0,
+  failures: 0,
+  lastError: '',
+  pages: 0,
+  productCount: 0,
+  siteName: '我的店铺',
+  currency: 'CNY',
+  nextCheck: 0,
+});
+export class StockService {
+  private scanning = false;
+  private sending = false;
+  private ticking = false;
+  private timer: ReturnType<typeof setInterval> | undefined;
+  private lastTargetSend = new Map<string, number>();
+  private boardLocks = new Set<string>();
+  constructor(
+    readonly store: Store,
+    readonly adapter: DujiaoAdapter,
+    readonly transport: Transport,
+    readonly adminId: string,
+  ) {}
+  runtime() {
+    return this.store.get('runtime', initialRuntime());
+  }
+  state() {
+    return this.store.get<EngineState>('engine', emptyEngine());
+  }
+  products(): Product[] {
+    return this.store.get<Product[]>('catalog', Object.values(this.state().accepted));
+  }
+  report(text: string, key: string = randomUUID()) {
+    this.store.enqueue(`system:${key}`, this.adminId, simpleMessage(escapeHTML(text)));
+  }
+  configure(c: Config) {
+    validateAppearance(c);
+    this.store.saveConfig(c);
+  }
+  async connect(siteUrl: string, apiUrl: string) {
+    const c = this.store.config();
+    c.siteUrl = siteUrl.replace(/\/+$/, '');
+    c.apiUrl = apiUrl.replace(/\/+$/, '');
+    const scan = await this.adapter.scan(c);
+    const current = this.store.config();
+    const changed = current.siteUrl !== c.siteUrl || current.apiUrl !== c.apiUrl;
+    current.siteUrl = c.siteUrl;
+    current.apiUrl = c.apiUrl;
+    if (changed) current.products = {};
+    this.store.transaction(() => {
+      if (changed) {
+        this.store.delete('engine');
+        this.store.delete('batch');
+        this.store.delete('boards');
+        this.store.db.exec("UPDATE jobs SET status='cancelled' WHERE status='pending'");
+      }
+      this.store.saveConfig(current);
+      this.commit(scan, current, true);
+    });
+    return scan;
+  }
+  private commit(scan: Scan, c: Config, baseline = false) {
+    const oldRuntime = this.runtime();
+    const result = advance(baseline ? emptyEngine() : this.state(), scan.products, c, scan.at);
+    this.store.set('engine', result.state);
+    this.store.set('catalog', scan.products);
+    this.store.saveConfig(c);
+    if (c.notifications && !c.paused && result.events.length) {
+      const batch = this.store.get<Batch | null>('batch', null) ?? {
+        id: randomUUID(),
+        openedAt: scan.at,
+        events: [],
+      };
+      batch.events.push(...result.events);
+      this.store.set('batch', batch);
+    }
+    this.store.set('runtime', {
+      ...oldRuntime,
+      lastSuccess: scan.at,
+      failures: 0,
+      lastError: '',
+      pages: scan.pages,
+      productCount: scan.products.length,
+      siteName: scan.siteName,
+      currency: scan.currency,
+      nextCheck: Math.max(oldRuntime.lastAttempt + c.timing.interval * 1000, Date.now()),
+    });
+    if (oldRuntime.failures >= 3) this.report('店铺连接已恢复。');
+  }
+  async check(force = false): Promise<string> {
+    if (this.scanning) return '已有检查正在进行，不会重复启动。';
+    const c = this.store.config();
+    if (!c.siteUrl) return '请先连接网站。';
+    if (c.paused && !force) return '监测已暂停。';
+    const cooldown = this.store.get('site-cooldown', 0);
+    if (Date.now() < cooldown)
+      return `网站限流等待中，${Math.ceil((cooldown - Date.now()) / 1000)} 秒后可重试。`;
+    this.scanning = true;
+    const siteKey = `${c.siteUrl}|${c.apiUrl}`;
+    this.store.set('runtime', { ...this.runtime(), lastAttempt: Date.now() });
+    try {
+      const scan = await this.adapter.scan(c);
+      const current = this.store.config();
+      if (`${current.siteUrl}|${current.apiUrl}` !== siteKey)
+        return '检查期间网站配置已更改，已丢弃旧网站结果。';
+      this.store.transaction(() => {
+        this.commit(scan, current);
+        this.flush(Date.now());
+      });
+      return `检查成功：${scan.products.length} 个商品，${scan.pages} 页。`;
+    } catch (e) {
+      const rt = this.runtime(),
+        failures = rt.failures + 1,
+        message = e instanceof Error ? e.message : '检查失败';
+      const wait = Math.max(
+        c.timing.interval * 1000,
+        Math.min(300000, 5000 * 2 ** Math.min(failures - 1, 6)),
+        e instanceof FetchError ? e.retryAfter : 0,
+      );
+      if (e instanceof FetchError && e.retryAfter)
+        this.store.set('site-cooldown', Date.now() + e.retryAfter);
+      this.store.set('runtime', {
+        ...rt,
+        failures,
+        lastError: message,
+        nextCheck: Date.now() + wait,
+      });
+      // Consecutive successful observations must not span an interrupted/incomplete scan.
+      const state = this.state();
+      state.candidates = {};
+      state.missing = {};
+      this.store.set('engine', state);
+      if (failures === 3) this.report(`店铺连续 3 次检查失败，已退避重试。\n${message}`);
+      return `检查失败：${message}`;
+    } finally {
+      this.scanning = false;
+    }
+  }
+  flush(now = Date.now()) {
+    const batch = this.store.get<Batch | null>('batch', null);
+    if (!batch) return;
+    const c = this.store.config();
+    if (now < batch.openedAt + c.timing.mergeWindow * 1000) return;
+    if (c.notifications && !c.paused) {
+      const events = mergeChanges(batch.events, c);
+      if (events.length) {
+        const rt = this.runtime();
+        const messages = renderNotification(
+          c,
+          this.products(),
+          events,
+          rt.siteName,
+          rt.currency,
+          rt.lastSuccess,
+        );
+        for (const target of c.targets.filter((t) => t.enabled))
+          messages.forEach((p, i) =>
+            this.store.enqueue(`${batch.id}:${target.id}:${i}`, target.id, p),
+          );
+      }
+    }
+    this.store.delete('batch');
+  }
+  async sendDue(now = Date.now()) {
+    if (this.sending || this.store.get('telegram-cooldown', 0) > now) return;
+    this.sending = true;
+    try {
+      const config = this.store.config();
+      const enabled = new Set(config.targets.filter((t) => t.enabled).map((t) => t.id));
+      const attempted = new Set<string>();
+      const deliveries: Promise<void>[] = [];
+      for (const job of this.store.dueJobs(now)) {
+        if (
+          attempted.has(job.target) ||
+          (this.lastTargetSend.get(job.target) ?? 0) > now - 1100 ||
+          this.store.get(`target-cooldown:${job.target}`, 0) > now
+        )
+          continue;
+        if (
+          !job.dedupe.startsWith('system:') &&
+          !job.dedupe.startsWith('emoji-fallback:') &&
+          (!enabled.has(job.target) || !config.notifications || config.paused)
+        ) {
+          if (!enabled.has(job.target)) this.store.updateJob(job.id, 'cancelled', job.attempts, 0);
+          continue;
+        }
+        attempted.add(job.target);
+        this.lastTargetSend.set(job.target, now);
+        this.store.updateJob(job.id, 'sending', job.attempts + 1, 0);
+        deliveries.push(
+          (async () => {
+            try {
+              await this.transport.send(job.target, job.payload);
+              this.store.updateJob(job.id, 'sent', job.attempts + 1, 0);
+            } catch (e) {
+              const error =
+                e instanceof DeliveryError ? e : new DeliveryError('发送结果未知', 'uncertain');
+              const state =
+                error.kind === 'uncertain'
+                  ? 'uncertain'
+                  : error.kind === 'permanent'
+                    ? 'failed'
+                    : 'pending';
+              const delay =
+                error.kind === 'rate'
+                  ? error.retryAfter
+                  : Math.min(3600000, 5000 * 2 ** Math.min(job.attempts, 10));
+              if (error.kind === 'rate') {
+                this.lastTargetSend.set(job.target, now + delay);
+                this.store.set(`target-cooldown:${job.target}`, now + delay);
+                this.store.set('telegram-cooldown', now + delay);
+              }
+              this.store.updateJob(job.id, state, job.attempts + 1, now + delay, error.message);
+              if ((state === 'uncertain' || state === 'failed') && job.target !== this.adminId)
+                this.report(
+                  `目标 ${job.target} 发送${state === 'uncertain' ? '结果不确定' : '失败'}：${error.message}\n可在运行状态中处理。`,
+                  `job:${job.id}`,
+                );
+            }
+          })(),
+        );
+        if (attempted.size >= 10) break;
+      }
+      await Promise.all(deliveries);
+    } finally {
+      this.sending = false;
+    }
+  }
+  async board(target: string, page?: number, force = false): Promise<string> {
+    if (this.boardLocks.has(target)) return '看板正在更新。';
+    const c = this.store.config(),
+      rt = this.runtime();
+    if (!c.board || !rt.lastSuccess) return '看板尚未开启或没有库存数据。';
+    if (!c.targets.some((t) => t.id === target && t.enabled)) return '通知目标未启用。';
+    if (
+      Math.max(
+        this.store.get(`target-cooldown:${target}`, 0),
+        this.store.get('telegram-cooldown', 0),
+      ) > Date.now()
+    )
+      return 'Telegram 限流等待中。';
+    if (this.store.get(`board-uncertain:${target}`, false))
+      return '看板创建结果不确定，请在看板菜单确认后重建。';
+    this.boardLocks.add(target);
+    try {
+      const boards = this.store.get<Record<string, BoardRecord>>('boards', {}),
+        record = boards[target];
+      if (!force && record && Date.now() - record.updatedAt < c.timing.boardInterval * 1000)
+        return '等待看板更新间隔。';
+      const products = this.products();
+      const rendered = renderBoard(
+        c,
+        products,
+        rt.siteName,
+        rt.currency,
+        rt.lastSuccess,
+        page ?? record?.page ?? 0,
+      );
+      const signature = createHash('sha256')
+        .update(
+          JSON.stringify([
+            c.appearance,
+            c.products,
+            c.timing.pageSize,
+            products.filter((p) => isEnabled(c, p.id)),
+            rt.siteName,
+            rt.currency,
+            rendered.page,
+          ]),
+        )
+        .digest('hex');
+      if (!force && record?.signature === signature) return '内容没有变化。';
+      let id = record?.messageId;
+      if (id) {
+        try {
+          await this.transport.edit(target, id, rendered.payload);
+        } catch (e) {
+          if (
+            e instanceof DeliveryError &&
+            /message to edit not found|message can't be edited/i.test(e.message)
+          )
+            id = undefined;
+          else throw e;
+        }
+      }
+      if (!id) {
+        // Persist the creation marker before the network call; it survives crashes.
+        this.store.set(`board-uncertain:${target}`, true);
+        try {
+          id = await this.transport.send(target, rendered.payload);
+        } catch (e) {
+          if (e instanceof DeliveryError && e.kind !== 'uncertain')
+            this.store.delete(`board-uncertain:${target}`);
+          throw e;
+        }
+      }
+      const current = this.store.get<Record<string, BoardRecord>>('boards', {});
+      current[target] = { messageId: id, page: rendered.page, signature, updatedAt: Date.now() };
+      this.store.transaction(() => {
+        this.store.set('boards', current);
+        this.store.delete(`board-uncertain:${target}`);
+      });
+      this.store.delete(`board-error:${target}`);
+      return '看板已更新。';
+    } catch (e) {
+      const error = e instanceof Error ? e.message : '看板更新失败';
+      this.store.set(`board-error:${target}`, error);
+      const delay = e instanceof DeliveryError && e.kind === 'rate' ? e.retryAfter : 60000;
+      this.store.set(`target-cooldown:${target}`, Date.now() + delay);
+      if (e instanceof DeliveryError && e.kind === 'rate')
+        this.store.set('telegram-cooldown', Date.now() + delay);
+      const last = this.store.get(`board-alert:${target}`, 0);
+      if (Date.now() - last > 3600000) {
+        this.report(`目标 ${target} 看板更新失败：${error}`);
+        this.store.set(`board-alert:${target}`, Date.now());
+      }
+      return error;
+    } finally {
+      this.boardLocks.delete(target);
+    }
+  }
+  resetBoard(target: string) {
+    const boards = this.store.get<Record<string, BoardRecord>>('boards', {});
+    delete boards[target];
+    this.store.set('boards', boards);
+    this.store.delete(`board-uncertain:${target}`);
+    this.store.delete(`target-cooldown:${target}`);
+  }
+  start() {
+    this.timer = setInterval(() => {
+      void this.tick().catch((e) => {
+        this.store.set('service-error', String(e));
+        console.error('后台任务异常，请查看 Bot 运行状态');
+      });
+    }, 1000);
+  }
+  async tick() {
+    if (this.ticking) return;
+    this.ticking = true;
+    try {
+      const c = this.store.config(),
+        rt = this.runtime();
+      const due = rt.failures
+        ? rt.nextCheck
+        : Math.min(rt.nextCheck, rt.lastAttempt + c.timing.interval * 1000);
+      if (!c.paused && c.siteUrl && Date.now() >= due && !this.scanning)
+        void this.check().catch(() => {});
+      this.store.transaction(() => this.flush());
+      void this.sendDue().catch((e) => this.store.set('service-error', String(e)));
+      if (!c.paused && c.board)
+        for (const t of c.targets.filter((t) => t.enabled))
+          void this.board(t.id).catch((e) => this.store.set('service-error', String(e)));
+      if (Date.now() - this.store.get('last-prune', 0) > 3600000) {
+        this.store.prune();
+        this.store.set('last-prune', Date.now());
+      }
+    } finally {
+      this.ticking = false;
+    }
+  }
+  async stop() {
+    if (this.timer) clearInterval(this.timer);
+    while (this.scanning || this.ticking || this.sending || this.boardLocks.size)
+      await new Promise((r) => setTimeout(r, 50));
+  }
+}
