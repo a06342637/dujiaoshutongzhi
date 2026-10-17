@@ -17,7 +17,9 @@ GitHub 与部署验证：
 
 - [首次完整 CI](https://github.com/a06342637/dujiaoshutongzhi/actions/runs/39060919134) 的测试、编译、应用包生成和 amd64／arm64 镜像构建全部成功。
 - 实际 CI 更新包已下载，通过大小与 SHA-256 校验，解压后在 Node.js 24 成功导入 Bot、更新监督程序及 SQLite，确认发布包不依赖开发依赖。
-- 标签发布流程还会在两个架构的实际镜像中，以非 root 用户和只读根文件系统验证 SQLite 数据卷及更新状态写入；最终结果请查看 v0.1.0 标签流水线。
+- [正式发布验证](https://github.com/a06342637/dujiaoshutongzhi/actions/runs/39061504102) 已全部通过：两个架构的实际镜像均以非 root 用户和只读根文件系统运行，成功读写 SQLite 数据卷和更新状态文件。
+- [v0.1.0 正式版](https://github.com/a06342637/dujiaoshutongzhi/releases/tag/v0.1.0) 已公开，包含应用更新包和 SHA-256 清单；镜像已验证支持匿名拉取。
+- 已通过程序自身的更新逻辑读取正式版、下载校验并解压更新包，且当前版本不会误提示重复安装。早期发布脚本的循环语法错误已修复，以上正式发布验证为成功重跑结果。
 - 未提供真实 Bot Token、管理员 ID、目标频道／群和实际店铺，未做实机 Telegram 显示、权限、频道置顶及端到端联调。
 - 真实 Telegram 客户端的渲染和权限不能通过模拟 API 或 CI 证明。
 
