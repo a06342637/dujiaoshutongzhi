@@ -6,16 +6,18 @@
 
 - TypeScript 严格类型检查，包括未使用变量检查。
 - `npm run build` 编译成功。
-- 基础版本在 Node.js **24.22.0** 下 42 项测试通过；v0.1.0 新增版本更新及回退测试。最新完整结果以本仓库 Actions 对应提交为准。
+- Node.js **24.22.0** 下 **50 项测试全部通过**，覆盖基础功能和版本更新回退。
 - 默认本地 Node.js 26 环境的核心测试通过；项目运行基线仍为 Node.js 24。
 - `npm audit --omit=dev`：0 个已知漏洞。
 - 使用本项目 `DujiaoAdapter` 只读访问官方演示站 `https://demo.dujiaoka.com`，成功读取 CNY 币种、2 个商品、1 页数据；未写入店铺或创建订单。
 - 编译产物在缺少必填环境变量时正常拒绝启动，并显示中文说明，不调用 Telegram。
 - 自动化测试使用本地 HTTP 测试服务器、临时 SQLite 数据库及模拟 Telegram API，不需要真实 Bot Token。
 
-尚未完成：
+GitHub 与部署验证：
 
-- 当前本地开发环境未安装 Docker；amd64／arm64 镜像构建在 GitHub Actions 执行，结果请查看对应提交及 v0.1.0 标签的流水线。
+- [首次完整 CI](https://github.com/a06342637/dujiaoshutongzhi/actions/runs/39060919134) 的测试、编译、应用包生成和 amd64／arm64 镜像构建全部成功。
+- 实际 CI 更新包已下载，通过大小与 SHA-256 校验，解压后在 Node.js 24 成功导入 Bot、更新监督程序及 SQLite，确认发布包不依赖开发依赖。
+- 标签发布流程还会在两个架构的实际镜像中，以非 root 用户和只读根文件系统验证 SQLite 数据卷及更新状态写入；最终结果请查看 v0.1.0 标签流水线。
 - 未提供真实 Bot Token、管理员 ID、目标频道／群和实际店铺，未做实机 Telegram 显示、权限、频道置顶及端到端联调。
 - 真实 Telegram 客户端的渲染和权限不能通过模拟 API 或 CI 证明。
 
