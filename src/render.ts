@@ -1,4 +1,4 @@
-import { eventLabels, isEnabled, type Config, type Format } from './config.js';
+import { eventLabels, isEnabled, showsStock, type Config, type Format } from './config.js';
 import { isAvailable, isOut } from './engine.js';
 import { orderProducts } from './sorting.js';
 import type { Button, Change, MessagePayload, Product, Stock } from './types.js';
@@ -248,6 +248,7 @@ export function productButtons(products: Product[], c: Config, currency: string)
   const rows: Button[][] = [];
   for (const p of products) {
     const override = c.products[p.id];
+    const displayStock = showsStock(c, p.id);
     const entries =
       override?.expandSkus && p.skus.length
         ? p.skus.map((s) => ({
@@ -270,13 +271,13 @@ export function productButtons(products: Product[], c: Config, currency: string)
       const values = {
         product: item.name,
         spec: item.spec,
-        stock: stockText(item.stock),
+        stock: displayStock ? stockText(item.stock) : '',
         price: money(item.price, currency) + (item.from ? ' 起' : ''),
         emoji: emoji(c, p.id),
       };
       const custom = override?.customEmojiId ?? c.appearance.customEmojiId;
       const makeText = (withEmoji: boolean) =>
-        c.appearance.buttonTemplate
+        (displayStock ? c.appearance.buttonTemplate : '{emoji} {product}｜{price}')
           .replace(/\{([a-z_]+)\}/g, (_, k: string) =>
             k === 'emoji' && !withEmoji ? '' : String(values[k as keyof typeof values] ?? ''),
           )
@@ -326,8 +327,9 @@ function body(
   const details = events
     .map((e) => {
       const p = productMap.get(e.productId),
+        displayStock = showsStock(c, e.productId),
         delta =
-          e.before.kind === 'exact' && e.after.kind === 'exact'
+          displayStock && e.before.kind === 'exact' && e.after.kind === 'exact'
             ? e.after.quantity - e.before.quantity
             : null;
       const deltaString = delta === null ? '' : `${delta > 0 ? '+' : ''}${delta}`;
@@ -337,15 +339,27 @@ function body(
         spec: e.skuName || '',
         spec_line: e.skuName ? `\n  ${escapeHTML(e.skuName)}` : '',
         price: p ? money(p.price, currency) : '',
-        stock: stockText(e.after),
-        before: e.type === 'price' ? money(e.beforePrice!, currency) : shortStock(e.before),
-        after: e.type === 'price' ? money(e.afterPrice!, currency) : shortStock(e.after),
+        stock: displayStock ? stockText(e.after) : '',
+        before:
+          e.type === 'price'
+            ? money(e.beforePrice!, currency)
+            : displayStock
+              ? shortStock(e.before)
+              : '',
+        after:
+          e.type === 'price'
+            ? money(e.afterPrice!, currency)
+            : displayStock
+              ? shortStock(e.after)
+              : '',
         delta: deltaString,
         delta_text: e.type === 'price' || !deltaString ? '' : `（${escapeHTML(deltaString)}）`,
         event: eventLabels[e.type],
         url: p ? productURL(c, p) : c.siteUrl,
         emoji: emoji(c, e.productId, true),
       };
+      if (!displayStock && e.type !== 'price')
+        return `${values.emoji} <b>${escapeHTML(values.product)}</b>${values.spec_line}\n${escapeHTML(values.event)}`;
       return template(f.changeTemplate, values, ['emoji', 'spec_line', 'delta_text']);
     })
     .join('\n\n');

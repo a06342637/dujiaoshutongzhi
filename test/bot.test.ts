@@ -12,6 +12,7 @@ import { product, scan } from './fixtures.js';
 import { VERSION } from '../src/version.js';
 import { INVENTORY_COPY_FOOTER } from '../src/inventory-copy.js';
 import { sortedProducts, renderBoard, renderNotification } from '../src/render.js';
+import { inventoryCopyText } from '../src/inventory-copy.js';
 
 function fixture(apiReply?: (method: string, payload: any) => any) {
   const store = new Store(':memory:');
@@ -196,6 +197,57 @@ test('home copy inventory refreshes data and sends clipboard text with exact foo
     assert.ok(!copied.includes('商品 2'));
     assert.ok(copied.endsWith(INVENTORY_COPY_FOOTER));
     assert.equal(f.store.config().paused, true);
+  } finally {
+    f.store.close();
+  }
+});
+test('per-product stock visibility saves as a draft and does not change monitoring', async () => {
+  const f = fixture();
+  try {
+    await f.click('pstock:1');
+    assert.equal(f.store.config().products['1']!.showStock, undefined);
+    await f.click('draft:save');
+    const c = f.store.config();
+    assert.equal(c.products['1']!.showStock, false);
+    assert.equal(c.products['1']!.enabled, true);
+    const text = inventoryCopyText([product(983)], c, 'CNY')!;
+    assert.ok(!text.includes('983'));
+    assert.ok(text.includes('商品 1'));
+    await f.click('pinherit:1');
+    await f.click('draft:save');
+    assert.ok(inventoryCopyText([product(983)], f.store.config(), 'CNY')!.includes('983'));
+  } finally {
+    f.store.close();
+  }
+});
+test('logs menu prints the last 50 lines, escapes HTML and blocks non-admin access', async () => {
+  const f = fixture();
+  try {
+    for (let i = 0; i < 70; i++) f.service.logs.info(`row-${String(i).padStart(3, '0')} <event>`);
+    await f.click('logs', 2);
+    assert.ok(!f.calls.some((c) => String(c.payload.text).includes('row-')));
+    await f.click('logs');
+    let text = String(f.calls.at(-1)!.payload.text);
+    assert.ok(text.includes('最近 50 行'));
+    assert.ok(text.includes('row-020'));
+    assert.ok(!text.includes('row-019'));
+    assert.ok(text.includes('&lt;event&gt;'));
+    await f.click('logs:page:1');
+    text = String(f.calls.at(-1)!.payload.text);
+    assert.ok(text.length < 4096);
+    f.service.logs.info('newest');
+    await f.click('logs');
+    await f.click('logs:page:999');
+    assert.ok(String(f.calls.at(-1)!.payload.text).includes('newest'));
+  } finally {
+    f.store.close();
+  }
+});
+test('empty logs menu is usable before the first runtime event', async () => {
+  const f = fixture();
+  try {
+    await f.input('/logs');
+    assert.ok(String(f.calls.at(-1)!.payload.text).includes('暂无应用日志'));
   } finally {
     f.store.close();
   }

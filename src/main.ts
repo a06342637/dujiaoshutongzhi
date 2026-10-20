@@ -9,6 +9,7 @@ import { AdminBot } from './bot.js';
 import { validateAppearance } from './render.js';
 import { UpdateManager } from './updater.js';
 import { VERSION } from './version.js';
+import { AppLogger } from './logger.js';
 
 const token = process.env.BOT_TOKEN?.trim(),
   admin = process.env.ADMIN_USER_ID?.trim();
@@ -18,6 +19,7 @@ if (!token || !/^\d+:[\w-]+$/.test(token) || !admin || !/^\d{1,20}$/.test(admin)
 }
 const data = resolve(process.env.DATA_DIR || 'data');
 mkdirSync(data, { recursive: true });
+const logs = new AppLogger({ directory: data, secrets: [token], console: true });
 const store = new Store(resolve(data, 'bot.sqlite'));
 validateAppearance(store.config());
 const bot = new Bot(token, { client: { timeoutSeconds: 35 } });
@@ -26,10 +28,11 @@ const service = new StockService(
   new DujiaoAdapter(),
   new TelegramTransport(bot.api, store, admin),
   admin,
+  logs,
 );
 const updates = new UpdateManager(data);
 new AdminBot(bot, service, updates);
-bot.catch(() => console.error('Telegram 更新处理失败，请在 Bot 中重试。'));
+bot.catch((error) => logs.error('Telegram 更新处理失败', { error: String(error.error) }));
 let stopping = false;
 const heartbeat = setInterval(
   () => writeFileSync(resolve(data, 'heartbeat'), String(Date.now())),
@@ -41,6 +44,7 @@ async function shutdown() {
   clearInterval(heartbeat);
   if (bot.isRunning()) await bot.stop();
   await service.stop();
+  logs.info('Bot 正在停止');
   store.close();
   if (process.connected) process.disconnect();
 }
@@ -62,6 +66,7 @@ try {
     { command: 'help', description: '使用说明' },
     { command: 'version', description: '当前版本与程序更新' },
     { command: 'settings', description: '设置与一键更新' },
+    { command: 'logs', description: '查看最近 50 行应用日志' },
   ]);
   if (process.send && process.env.DUJIAO_SUPERVISED === '1') {
     // Probe polling without advancing the offset before declaring the candidate healthy.
@@ -89,14 +94,14 @@ try {
     store.set('last-update-report', result.id);
   }
   service.start();
-  console.log(`库存通知 Bot v${VERSION} 已启动，请由管理员私聊发送 /start。`);
+  logs.info(`库存通知 Bot v${VERSION} 已启动，请由管理员私聊发送 /start。`);
   await bot.start({
     allowed_updates: ['message', 'callback_query', 'my_chat_member'],
     onStart: () => {},
   });
 } catch (e) {
   const message = e instanceof Error ? e.message : '启动失败';
-  console.error(message.replaceAll(token, '[TOKEN]'));
+  logs.error('Bot 启动或运行失败', { error: message });
   await shutdown();
   process.exitCode = 1;
 }

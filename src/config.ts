@@ -99,6 +99,7 @@ const productOverrideSchema = z
     order: z.number().int().min(-100000).max(100000).optional(),
     url: buttonUrl.optional(),
     expandSkus: z.boolean().optional(),
+    showStock: z.boolean().optional(),
     events: partialEvents.optional(),
     threshold: num('threshold').optional(),
     confirmations: num('confirmations').optional(),
@@ -216,6 +217,9 @@ export function defaults(): Config {
 }
 export function isEnabled(c: Config, id: string) {
   return c.products[id]?.enabled ?? c.autoMonitorNew;
+}
+export function showsStock(c: Config, id: string) {
+  return c.products[id]?.showStock ?? true;
 }
 export function rules(c: Config, id: string) {
   const p = c.products[id];

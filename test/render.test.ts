@@ -137,3 +137,26 @@ test('periodic notices include inventory even when the notification button filte
   assert.equal(result[0]!.reply_markup.inline_keyboard.flat().filter((b) => b.url).length, 1);
   assert.equal(c.appearance.filter, 'changed');
 });
+test('hidden inventory never appears in copy-style buttons, board, periodic or change details', () => {
+  const c = defaults();
+  c.siteUrl = 'https://shop.example';
+  c.products['1'] = { enabled: true, showStock: false, expandSkus: true };
+  c.appearance.buttonTemplate = '{product} {price} 库存:{stock}';
+  c.appearance.notification.changeTemplate =
+    '{product} 库存{stock} 原来{before} 现在{after} 差额{delta}{delta_text}';
+  const p = product(983),
+    e: Change = { ...event, type: 'decrease', before: stock(999), after: stock(983) };
+  const notice = renderNotification(c, [p], [e], '店铺', 'CNY', 1)[0]!;
+  const board = renderBoard(c, [p], '店铺', 'CNY', 1, 0).payload;
+  const periodic = renderPeriodicNotification(c, [p], '店铺', 'CNY', 1)[0]!;
+  for (const message of [notice, board, periodic]) {
+    assert.ok(!JSON.stringify(message).includes('983'));
+    assert.ok(!JSON.stringify(message).includes('999'));
+    const label = message.reply_markup.inline_keyboard[0]![0]!.text;
+    assert.ok(!label.includes('库存'));
+    assert.ok(label.includes('20.00'));
+  }
+  assert.ok(notice.text.includes('可售减少'));
+  c.products['1']!.showStock = true;
+  assert.ok(renderNotification(c, [p], [e], '店铺', 'CNY', 1)[0]!.text.includes('983'));
+});

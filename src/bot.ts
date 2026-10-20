@@ -41,6 +41,7 @@ const visualKeys = [
   'order',
   'url',
   'expandSkus',
+  'showStock',
 ] as const;
 const visualLabels = {
   name: '显示名称',
@@ -50,6 +51,7 @@ const visualLabels = {
   order: '排序数字',
   url: '购买链接',
   expandSkus: '规格展示',
+  showStock: '对外库存展示',
 };
 const styles = ['auto', 'default', 'success', 'danger', 'primary'] as const;
 const styleNames = {
@@ -83,6 +85,7 @@ export function canManage(
   return String(userId) === adminId && chatType === 'private';
 }
 export class AdminBot {
+  private logView: { pages: string[]; lines: number } | null = null;
   constructor(
     readonly bot: Bot,
     readonly service: StockService,
@@ -223,7 +226,7 @@ export class AdminBot {
           [cb('🎨 按钮样式', 'buttons'), cb('📊 库存看板', 'boards')],
           [cb('🛠 运行状态', 'status'), cb('💾 备份与恢复', 'backup')],
           [cb('⚙️ 设置／版本更新', 'settings')],
-          [cb('📋 复制库存', 'copy-stock')],
+          [cb('📋 复制库存', 'copy-stock'), cb('📜 查看日志', 'logs')],
           [cb(c.paused ? '▶ 恢复监测' : '⏸ 暂停监测', 'toggle:paused'), cb('🔎 立即检查', 'check')],
           ...(draft
             ? [[cb('👁 预览草稿', 'preview:notification'), cb('💾 保存草稿', 'draft:save')]]
@@ -387,7 +390,7 @@ export class AdminBot {
       );
       return this.show(
         ctx,
-        `<b>${escapeHTML(e.name || p.name)}</b>\nID：${p.id} · ${escapeHTML(stockText(p.stock))}\n${escapeHTML(p.categoryName)}\n图标：${escapeHTML(e.emoji ?? c.appearance.emoji)}；自定义 ID：${escapeHTML(e.customEmojiId ?? '继承')}\n颜色：${styleNames[e.style ?? c.appearance.style]}；排序值：${e.order ?? 0}\n全店位置：第 ${sortIndex + 1} 位（草稿）；保存后生效。`,
+        `<b>${escapeHTML(e.name || p.name)}</b>\nID：${p.id} · ${escapeHTML(stockText(p.stock))}\n${escapeHTML(p.categoryName)}\n图标：${escapeHTML(e.emoji ?? c.appearance.emoji)}；自定义 ID：${escapeHTML(e.customEmojiId ?? '继承')}\n颜色：${styleNames[e.style ?? c.appearance.style]}；排序值：${e.order ?? 0}\n全店位置：第 ${sortIndex + 1} 位（草稿）；保存后生效。\n关闭对外库存展示后，复制文案、通知和看板不显示库存数字，管理页仍可查看真实库存。`,
         [
           [cb(`${onoff(isEnabled(c, p.id))} 监测此商品`, `product-toggle:${p.id}`)],
           [cb('显示名称', `pinput:${p.id}:name`), cb('普通表情', `pinput:${p.id}:emoji`)],
@@ -396,6 +399,7 @@ export class AdminBot {
           [cb('⬆️ 上移', `pmove:${p.id}:up`), cb('⬇️ 下移', `pmove:${p.id}:down`)],
           [cb('⏫ 置顶', `pmove:${p.id}:top`), cb('⏬ 置底', `pmove:${p.id}:bottom`)],
           [cb(`${onoff(e.expandSkus ?? false)} 展开规格按钮`, `expand:${p.id}`)],
+          [cb(`${onoff(e.showStock ?? true)} 对外展示库存（复制／通知）`, `pstock:${p.id}`)],
           [cb('独立通知规则', `prules:${p.id}`), cb('恢复外观继承', `pinherit:${p.id}`)],
           [cb('👁 预览', 'preview:notification'), cb('💾 保存草稿', 'draft:save')],
           [
@@ -567,6 +571,7 @@ export class AdminBot {
         ctx,
         `<b>🛠 运行状态</b>\n最近成功：${fmt(rt.lastSuccess)}\n最近尝试：${fmt(rt.lastAttempt)}\n商品：${rt.productCount}；分页：${rt.pages}\n连续失败：${rt.failures}\n最近错误：${escapeHTML(rt.lastError || '无')}\n服务错误：${escapeHTML(this.store.get('service-error', '无'))}\n队列：${counts.map((x) => `${x.status} ${x.count}`).join('，') || '空'}\n结果不确定的消息不会自动重发。`,
         [
+          [cb('📜 最近 50 行日志', 'logs')],
           [cb('🔎 立即检查', 'check'), cb('失败／不确定详情', 'failures')],
           [cb('确认重试失败消息', 'confirm:retry')],
           homeRow,
@@ -647,12 +652,41 @@ export class AdminBot {
     const parts = data.split(':'),
       [action, a, b] = parts;
     const c = this.config();
+    if (action === 'logs') {
+      if (a !== 'page' || !this.logView) {
+        const lines = this.service.logs.recent(50);
+        this.logView = {
+          lines: lines.length,
+          pages: lines.length
+            ? splitHTML(`<pre>${escapeHTML(lines.join('\n'))}</pre>`)
+            : ['暂无应用日志；运行检查或发送通知后会自动记录。'],
+        };
+      }
+      const view = this.logView,
+        page = Math.max(0, Math.min(view.pages.length - 1, Math.trunc(Number(b) || 0)));
+      return this.show(
+        ctx,
+        `<b>📜 最近 ${view.lines} 行应用日志（最多 50 行，北京时间）</b>\n第 ${page + 1}/${view.pages.length} 页\n\n${view.pages[page]}`,
+        [
+          ...(view.pages.length > 1
+            ? [
+                [
+                  cb('◀ 上一页', `logs:page:${Math.max(0, page - 1)}`),
+                  cb('下一页 ▶', `logs:page:${Math.min(view.pages.length - 1, page + 1)}`),
+                ],
+              ]
+            : []),
+          [cb('🔄 刷新日志', 'logs'), cb('运行状态', 'status')],
+          homeRow,
+        ],
+      );
+    }
     if (action === 'copy-stock') {
       await ctx.reply('正在读取当前库存，生成后可长按文案或使用代码块的复制按钮复制。');
       const snapshot = await this.service.freshInventory();
       const content = inventoryCopyText(snapshot.products, this.config(), snapshot.currency);
       if (!content) {
-        await ctx.reply('当前没有有货商品。');
+        await ctx.reply('当前没有已勾选且有货的商品。');
         return;
       }
       const parts = splitHTML(`<pre>${escapeHTML(content)}</pre>`);
@@ -845,6 +879,11 @@ export class AdminBot {
     }
     if (action === 'expand') {
       this.patchVisual(a!, 'expandSkus', !this.edited().products[a!]?.expandSkus);
+      return this.menu(ctx, `product:${a}`);
+    }
+    if (action === 'pstock') {
+      if (!a || !this.service.products().some((p) => p.id === a)) throw new Error('商品不存在。');
+      this.patchVisual(a, 'showStock', !(this.edited().products[a]?.showStock ?? true));
       return this.menu(ctx, `product:${a}`);
     }
     if (action === 'pinherit') {
@@ -1296,6 +1335,7 @@ export class AdminBot {
       await this.menu(ctx);
     });
     this.bot.command(['version', 'settings'], (ctx) => this.menu(ctx, 'settings'));
+    this.bot.command('logs', (ctx) => this.onCallback(ctx, 'logs'));
     this.bot.command('cancel', async (ctx) => {
       const p = this.store.get<Pending | null>('pending', null);
       this.store.delete('pending');
@@ -1366,6 +1406,7 @@ export class AdminBot {
   }
   private errorMessage(e: unknown) {
     const message = e instanceof Error ? e.message : '操作失败';
+    this.service.logs.warn('管理操作失败', { error: message });
     return message.replaceAll(this.bot.token, '[TOKEN]').slice(0, 1500);
   }
 }

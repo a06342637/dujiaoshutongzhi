@@ -13,6 +13,7 @@ import {
 import type { Store } from './store.js';
 import { DeliveryError, simpleMessage, type Transport } from './telegram.js';
 import type { Batch, BoardRecord, EngineState, Product, Runtime, Scan } from './types.js';
+import { AppLogger } from './logger.js';
 
 const initialRuntime = (): Runtime => ({
   lastSuccess: 0,
@@ -42,6 +43,7 @@ export class StockService {
     readonly adapter: DujiaoAdapter,
     readonly transport: Transport,
     readonly adminId: string,
+    readonly logs: AppLogger = new AppLogger(),
   ) {}
   runtime() {
     return this.store.get('runtime', initialRuntime());
@@ -53,12 +55,19 @@ export class StockService {
     return this.store.get<Product[]>('catalog', Object.values(this.state().accepted));
   }
   report(text: string, key: string = randomUUID()) {
+    this.logs.info('管理员状态通知', { message: text });
     this.store.enqueue(`system:${key}`, this.adminId, simpleMessage(escapeHTML(text)));
   }
   configure(c: Config) {
     validateAppearance(c);
     this.store.saveConfig(c);
     this.syncPeriodic(c);
+    this.logs.info('设置已保存', {
+      paused: c.paused,
+      notifications: c.notifications,
+      periodic: c.periodicNotifications,
+      targets: c.targets.length,
+    });
   }
   periodicNextAt() {
     return this.store.get<PeriodicSchedule | null>('periodic-schedule', null)?.nextAt ?? 0;
@@ -101,6 +110,10 @@ export class StockService {
       ...schedule,
       nextAt: scan.at + c.timing.periodicInterval * 1000,
     });
+    this.logs.info('定时库存通知已加入队列', {
+      targets: c.targets.filter((t) => t.enabled).length,
+      parts: messages.length,
+    });
   }
   async connect(siteUrl: string, apiUrl: string) {
     const c = this.store.config();
@@ -121,6 +134,11 @@ export class StockService {
       }
       this.store.saveConfig(current);
       this.commit(scan, current, true);
+    });
+    this.logs.info('网站连接成功', {
+      host: new URL(current.siteUrl).hostname,
+      products: scan.products.length,
+      pages: scan.pages,
     });
     return scan;
   }
@@ -152,6 +170,7 @@ export class StockService {
     });
     if (oldRuntime.failures >= 3) this.report('店铺连接已恢复。');
     this.enqueuePeriodic(scan, c);
+    return result.events.length;
   }
   async check(force = false): Promise<string> {
     return (await this.startCheck(force)).message;
@@ -196,9 +215,15 @@ export class StockService {
       const current = this.store.config();
       if (`${current.siteUrl}|${current.apiUrl}` !== siteKey)
         return { ok: false, message: '检查期间网站配置已更改，已丢弃旧网站结果。' };
-      this.store.transaction(() => {
-        this.commit(scan, current);
+      const changes = this.store.transaction(() => {
+        const count = this.commit(scan, current);
         this.flush(Date.now());
+        return count;
+      });
+      this.logs.info('库存检查成功', {
+        products: scan.products.length,
+        pages: scan.pages,
+        changes,
       });
       return { ok: true, message: `检查成功：${scan.products.length} 个商品，${scan.pages} 页。` };
     } catch (e) {
@@ -226,6 +251,11 @@ export class StockService {
       state.missing = {};
       this.store.set('engine', state);
       if (failures === 3) this.report(`店铺连续 3 次检查失败，已退避重试。\n${message}`);
+      this.logs.error('库存检查失败', {
+        error: message,
+        failures,
+        retrySeconds: Math.ceil(wait / 1000),
+      });
       return { ok: false, message: `检查失败：${message}` };
     } finally {
       this.scanning = false;
@@ -291,6 +321,11 @@ export class StockService {
             try {
               await this.transport.send(job.target, job.payload);
               this.store.updateJob(job.id, 'sent', job.attempts + 1, 0);
+              this.logs.info('Telegram 通知发送成功', {
+                target: job.target,
+                job: job.id,
+                type: periodic ? 'periodic' : 'notification',
+              });
             } catch (e) {
               const error =
                 e instanceof DeliveryError ? e : new DeliveryError('发送结果未知', 'uncertain');
@@ -310,6 +345,12 @@ export class StockService {
                 this.store.set('telegram-cooldown', now + delay);
               }
               this.store.updateJob(job.id, state, job.attempts + 1, now + delay, error.message);
+              this.logs.error('Telegram 通知发送失败', {
+                target: job.target,
+                job: job.id,
+                status: state,
+                error: error.message,
+              });
               if ((state === 'uncertain' || state === 'failed') && job.target !== this.adminId)
                 this.report(
                   `目标 ${job.target} 发送${state === 'uncertain' ? '结果不确定' : '失败'}：${error.message}\n可在运行状态中处理。`,
@@ -400,10 +441,12 @@ export class StockService {
         this.store.delete(`board-uncertain:${target}`);
       });
       this.store.delete(`board-error:${target}`);
+      this.logs.info('库存看板已更新', { target, page: rendered.page + 1 });
       return '看板已更新。';
     } catch (e) {
       const error = e instanceof Error ? e.message : '看板更新失败';
       this.store.set(`board-error:${target}`, error);
+      this.logs.error('库存看板更新失败', { target, error });
       const delay = e instanceof DeliveryError && e.kind === 'rate' ? e.retryAfter : 60000;
       this.store.set(`target-cooldown:${target}`, Date.now() + delay);
       if (e instanceof DeliveryError && e.kind === 'rate')
@@ -429,7 +472,7 @@ export class StockService {
     this.timer = setInterval(() => {
       void this.tick().catch((e) => {
         this.store.set('service-error', String(e));
-        console.error('后台任务异常，请查看 Bot 运行状态');
+        this.logs.error('后台任务异常', { error: String(e) });
       });
     }, 1000);
   }
@@ -450,12 +493,18 @@ export class StockService {
         (Date.now() >= due || (periodicDue && !rt.failures)) &&
         !this.scanning
       )
-        void this.check().catch(() => {});
+        void this.check().catch((e) => this.logs.error('检查任务异常', { error: String(e) }));
       this.store.transaction(() => this.flush());
-      void this.sendDue().catch((e) => this.store.set('service-error', String(e)));
+      void this.sendDue().catch((e) => {
+        this.store.set('service-error', String(e));
+        this.logs.error('发送队列异常', { error: String(e) });
+      });
       if (!c.paused && c.board)
         for (const t of c.targets.filter((t) => t.enabled))
-          void this.board(t.id).catch((e) => this.store.set('service-error', String(e)));
+          void this.board(t.id).catch((e) => {
+            this.store.set('service-error', String(e));
+            this.logs.error('看板任务异常', { target: t.id, error: String(e) });
+          });
       if (Date.now() - this.store.get('last-prune', 0) > 3600000) {
         this.store.prune();
         this.store.set('last-prune', Date.now());

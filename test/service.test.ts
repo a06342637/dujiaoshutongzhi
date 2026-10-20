@@ -440,6 +440,24 @@ test('copy inventory refresh fails explicitly instead of returning cached stock'
     f.store.close();
   }
 });
+test('runtime logs include actual collection and delivery outcomes', async () => {
+  const f = fixture();
+  try {
+    await f.service.check();
+    f.adapter.next = scan([product(7)]);
+    await f.service.check();
+    await f.service.sendDue();
+    f.adapter.next = new FetchError('offline');
+    await f.service.check();
+    const logs = f.service.logs.recent().join('\n');
+    assert.ok(logs.includes('库存检查成功'));
+    assert.ok(logs.includes('Telegram 通知发送成功'));
+    assert.ok(logs.includes('库存检查失败'));
+    assert.ok(logs.includes('offline'));
+  } finally {
+    f.store.close();
+  }
+});
 test('copy inventory waits for an in-flight poll instead of failing or starting another request', async () => {
   const f = fixture();
   let finish: (result: Scan) => void = () => {};
