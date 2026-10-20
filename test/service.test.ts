@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve, basename } from 'node:path';
 import { Store } from '../src/store.js';
-import { defaults } from '../src/config.js';
+import { defaults, parseConfig } from '../src/config.js';
 import { DujiaoAdapter, FetchError } from '../src/adapter.js';
 import { StockService } from '../src/service.js';
 import { DeliveryError, simpleMessage, type Transport } from '../src/telegram.js';
@@ -256,6 +256,208 @@ test('large queue for one target does not starve other targets or administrator 
     await f.service.sendDue();
     assert.ok(f.transport.messages.some((m) => m.target === '-1002'));
     assert.ok(f.transport.messages.some((m) => m.target === '1'));
+  } finally {
+    f.store.close();
+  }
+});
+
+test('old configurations load with periodic notifications disabled', () => {
+  const old: any = defaults();
+  delete old.periodicNotifications;
+  delete old.timing.periodicInterval;
+  const c = parseConfig(old);
+  assert.equal(c.periodicNotifications, false);
+  assert.equal(c.timing.periodicInterval, 3600);
+});
+
+test('periodic snapshots send unchanged stock on each interval even with change notices disabled', async (t) => {
+  let now = 1000000;
+  t.mock.method(Date, 'now', () => now);
+  const f = fixture();
+  try {
+    const c = f.store.config();
+    c.notifications = false;
+    c.periodicNotifications = true;
+    c.timing.periodicInterval = 60;
+    c.board = false;
+    f.service.configure(c);
+    await f.service.check();
+    assert.equal(f.store.jobs().length, 0);
+    now += 59000;
+    await f.service.check();
+    assert.equal(f.store.jobs().length, 0);
+    now += 1000;
+    await f.service.check();
+    assert.equal(f.store.jobs().length, 2);
+    await f.service.sendDue();
+    assert.equal(f.transport.messages.length, 2);
+    assert.ok(f.transport.messages.every((m) => m.payload.text.includes('定时库存通知')));
+    now += 60000;
+    await f.service.check();
+    await f.service.sendDue();
+    assert.equal(f.transport.messages.length, 4);
+  } finally {
+    f.store.close();
+  }
+});
+
+test('periodic timer survives restart and does not catch up missed intervals in a burst', async (t) => {
+  let now = 1000000;
+  t.mock.method(Date, 'now', () => now);
+  const f = fixture();
+  try {
+    const c = f.store.config();
+    c.periodicNotifications = true;
+    c.timing.periodicInterval = 60;
+    f.service.configure(c);
+    await f.service.check();
+    const due = f.service.periodicNextAt();
+    const restarted = new StockService(f.store, f.adapter, f.transport, '1');
+    now += 30000;
+    await restarted.check();
+    assert.equal(restarted.periodicNextAt(), due);
+    assert.equal(f.store.jobs().length, 0);
+    now += 600000;
+    await restarted.check();
+    assert.equal(f.store.jobs().length, 2);
+    assert.equal(restarted.periodicNextAt(), now + 60000);
+    await restarted.check();
+    assert.equal(f.store.jobs().length, 2);
+  } finally {
+    f.store.close();
+  }
+});
+
+test('periodic interval edits restart timing and disabling or pausing cancels pending snapshots', async (t) => {
+  let now = 1000000;
+  t.mock.method(Date, 'now', () => now);
+  const f = fixture();
+  try {
+    const c = f.store.config();
+    c.periodicNotifications = true;
+    c.timing.periodicInterval = 60;
+    f.service.configure(c);
+    await f.service.check();
+    now += 30000;
+    c.timing.periodicInterval = 120;
+    f.service.configure(c);
+    assert.equal(f.service.periodicNextAt(), now + 120000);
+    now += 60000;
+    await f.service.check();
+    assert.equal(f.store.jobs().length, 0);
+    now += 60000;
+    await f.service.check();
+    assert.equal(f.store.jobs().length, 2);
+    c.paused = true;
+    f.service.configure(c);
+    assert.equal(f.store.jobs().length, 0);
+    assert.equal(f.service.periodicNextAt(), 0);
+    now += 10000;
+    c.paused = false;
+    f.service.configure(c);
+    assert.equal(f.service.periodicNextAt(), now + 120000);
+    now += 120000;
+    await f.service.check();
+    assert.equal(f.store.jobs().length, 2);
+    c.periodicNotifications = false;
+    f.service.configure(c);
+    await f.service.sendDue();
+    assert.equal(f.transport.messages.length, 0);
+  } finally {
+    f.store.close();
+  }
+});
+
+test('periodic timer waits for a successful fresh scan and honors website backoff', async (t) => {
+  let now = 1000000;
+  t.mock.method(Date, 'now', () => now);
+  const f = fixture();
+  try {
+    const c = f.store.config();
+    c.periodicNotifications = true;
+    c.timing.periodicInterval = 60;
+    c.timing.interval = 3600;
+    c.board = false;
+    f.service.configure(c);
+    await f.service.check();
+    now += 60000;
+    f.adapter.next = new FetchError('rate limited', 120000);
+    await f.service.tick();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(f.adapter.calls, 2);
+    assert.equal(f.store.jobs().length, 0);
+    assert.equal(f.service.runtime().nextCheck, now + 120000);
+    now += 1000;
+    await f.service.tick();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(f.adapter.calls, 2);
+    now = f.service.runtime().nextCheck + 1;
+    f.adapter.next = scan([product(8)], now);
+    await f.service.tick();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(f.store.jobs().filter((j) => j.dedupe.startsWith('periodic:')).length, 2);
+  } finally {
+    await f.service.stop();
+    f.store.close();
+  }
+});
+
+test('only the latest pending periodic batch survives and disabled change queues cannot block it', async (t) => {
+  let now = 1000000;
+  t.mock.method(Date, 'now', () => now);
+  const f = fixture();
+  try {
+    const c = f.store.config();
+    c.notifications = false;
+    c.periodicNotifications = true;
+    c.timing.periodicInterval = 60;
+    f.service.configure(c);
+    await f.service.check();
+    f.store.enqueue('old-change', '-1001', simpleMessage('old change'));
+    now += 60000;
+    await f.service.check();
+    const old = f.store.jobs().find((j) => j.dedupe.startsWith('periodic:'))!.dedupe;
+    now += 60000;
+    await f.service.check();
+    assert.equal(f.store.jobs().filter((j) => j.dedupe.startsWith('periodic:')).length, 2);
+    assert.ok(!f.store.jobs().some((j) => j.dedupe === old));
+    await f.service.sendDue();
+    assert.equal(f.transport.messages.length, 2);
+    assert.ok(f.transport.messages.every((m) => m.payload.text.includes('定时库存通知')));
+  } finally {
+    f.store.close();
+  }
+});
+
+test('copy inventory refresh fails explicitly instead of returning cached stock', async () => {
+  const f = fixture();
+  try {
+    await f.service.check();
+    f.adapter.next = new FetchError('offline');
+    await assert.rejects(f.service.freshInventory(), /无法读取当前库存/);
+    assert.equal(f.service.products()[0]!.stock.kind, 'exact');
+  } finally {
+    f.store.close();
+  }
+});
+test('copy inventory waits for an in-flight poll instead of failing or starting another request', async () => {
+  const f = fixture();
+  let finish: (result: Scan) => void = () => {};
+  let requests = 0;
+  f.adapter.scan = () => {
+    requests++;
+    return new Promise<Scan>((resolve) => {
+      finish = resolve;
+    });
+  };
+  try {
+    const poll = f.service.check();
+    const copying = f.service.freshInventory();
+    finish(scan([product(42)]));
+    await poll;
+    const result = await copying;
+    assert.equal(requests, 1);
+    assert.deepEqual(result.products[0]!.stock, { kind: 'exact', quantity: 42, status: 'in' });
   } finally {
     f.store.close();
   }

@@ -3,7 +3,13 @@ import type { Config } from './config.js';
 import { isEnabled } from './config.js';
 import { DujiaoAdapter, FetchError } from './adapter.js';
 import { advance, emptyEngine, mergeChanges } from './engine.js';
-import { renderBoard, renderNotification, escapeHTML, validateAppearance } from './render.js';
+import {
+  renderBoard,
+  renderNotification,
+  renderPeriodicNotification,
+  escapeHTML,
+  validateAppearance,
+} from './render.js';
 import type { Store } from './store.js';
 import { DeliveryError, simpleMessage, type Transport } from './telegram.js';
 import type { Batch, BoardRecord, EngineState, Product, Runtime, Scan } from './types.js';
@@ -19,7 +25,12 @@ const initialRuntime = (): Runtime => ({
   currency: 'CNY',
   nextCheck: 0,
 });
+interface PeriodicSchedule {
+  signature: string;
+  nextAt: number;
+}
 export class StockService {
+  private activeCheck: Promise<{ ok: boolean; message: string }> | undefined;
   private scanning = false;
   private sending = false;
   private ticking = false;
@@ -47,6 +58,49 @@ export class StockService {
   configure(c: Config) {
     validateAppearance(c);
     this.store.saveConfig(c);
+    this.syncPeriodic(c);
+  }
+  periodicNextAt() {
+    return this.store.get<PeriodicSchedule | null>('periodic-schedule', null)?.nextAt ?? 0;
+  }
+  private syncPeriodic(c: Config, now = Date.now()): PeriodicSchedule | null {
+    if (!c.periodicNotifications || c.paused || !c.siteUrl || !c.targets.some((t) => t.enabled)) {
+      if (this.store.get('periodic-schedule', null) !== null) {
+        this.store.delete('periodic-schedule');
+        this.store.cancelPendingPeriodic();
+      }
+      return null;
+    }
+    const signature = JSON.stringify([c.siteUrl, c.apiUrl, c.timing.periodicInterval]);
+    const existing = this.store.get<PeriodicSchedule | null>('periodic-schedule', null);
+    if (existing?.signature === signature) return existing;
+    this.store.cancelPendingPeriodic();
+    const schedule = { signature, nextAt: now + c.timing.periodicInterval * 1000 };
+    this.store.set('periodic-schedule', schedule);
+    return schedule;
+  }
+  private enqueuePeriodic(scan: Scan, c: Config) {
+    const schedule = this.syncPeriodic(c, scan.at);
+    if (!schedule || scan.at < schedule.nextAt) return;
+    const messages = renderPeriodicNotification(
+        c,
+        scan.products,
+        scan.siteName,
+        scan.currency,
+        scan.at,
+      ),
+      id = randomUUID();
+    for (const target of c.targets.filter((t) => t.enabled)) {
+      // Expired, unsent snapshots should not burst into a recovered channel.
+      this.store.cancelPendingPeriodic(target.id);
+      messages.forEach((p, i) =>
+        this.store.enqueue(`periodic:${id}:${target.id}:${i}`, target.id, p),
+      );
+    }
+    this.store.set('periodic-schedule', {
+      ...schedule,
+      nextAt: scan.at + c.timing.periodicInterval * 1000,
+    });
   }
   async connect(siteUrl: string, apiUrl: string) {
     const c = this.store.config();
@@ -97,15 +151,43 @@ export class StockService {
       nextCheck: Math.max(oldRuntime.lastAttempt + c.timing.interval * 1000, Date.now()),
     });
     if (oldRuntime.failures >= 3) this.report('店铺连接已恢复。');
+    this.enqueuePeriodic(scan, c);
   }
   async check(force = false): Promise<string> {
-    if (this.scanning) return '已有检查正在进行，不会重复启动。';
+    return (await this.startCheck(force)).message;
+  }
+  private startCheck(force: boolean): Promise<{ ok: boolean; message: string }> {
+    if (this.activeCheck)
+      return Promise.resolve({ ok: false, message: '已有检查正在进行，请稍后重试。' });
+    const pending = this.collect(force).finally(() => {
+      if (this.activeCheck === pending) this.activeCheck = undefined;
+    });
+    this.activeCheck = pending;
+    return pending;
+  }
+  async freshInventory(): Promise<Scan> {
+    const result = await (this.activeCheck ?? this.startCheck(true));
+    if (!result.ok) throw new Error(`无法读取当前库存：${result.message}`);
+    const rt = this.runtime();
+    return {
+      products: this.products(),
+      at: rt.lastSuccess,
+      siteName: rt.siteName,
+      currency: rt.currency,
+      pages: rt.pages,
+    };
+  }
+  private async collect(force = false): Promise<{ ok: boolean; message: string }> {
+    if (this.scanning) return { ok: false, message: '已有检查正在进行，请稍后重试。' };
     const c = this.store.config();
-    if (!c.siteUrl) return '请先连接网站。';
-    if (c.paused && !force) return '监测已暂停。';
+    if (!c.siteUrl) return { ok: false, message: '请先连接网站。' };
+    if (c.paused && !force) return { ok: false, message: '监测已暂停。' };
     const cooldown = this.store.get('site-cooldown', 0);
     if (Date.now() < cooldown)
-      return `网站限流等待中，${Math.ceil((cooldown - Date.now()) / 1000)} 秒后可重试。`;
+      return {
+        ok: false,
+        message: `网站限流等待中，${Math.ceil((cooldown - Date.now()) / 1000)} 秒后可重试。`,
+      };
     this.scanning = true;
     const siteKey = `${c.siteUrl}|${c.apiUrl}`;
     this.store.set('runtime', { ...this.runtime(), lastAttempt: Date.now() });
@@ -113,18 +195,20 @@ export class StockService {
       const scan = await this.adapter.scan(c);
       const current = this.store.config();
       if (`${current.siteUrl}|${current.apiUrl}` !== siteKey)
-        return '检查期间网站配置已更改，已丢弃旧网站结果。';
+        return { ok: false, message: '检查期间网站配置已更改，已丢弃旧网站结果。' };
       this.store.transaction(() => {
         this.commit(scan, current);
         this.flush(Date.now());
       });
-      return `检查成功：${scan.products.length} 个商品，${scan.pages} 页。`;
+      return { ok: true, message: `检查成功：${scan.products.length} 个商品，${scan.pages} 页。` };
     } catch (e) {
       const rt = this.runtime(),
         failures = rt.failures + 1,
         message = e instanceof Error ? e.message : '检查失败';
       const wait = Math.max(
-        c.timing.interval * 1000,
+        (c.periodicNotifications && !c.paused && c.targets.some((t) => t.enabled)
+          ? Math.min(c.timing.interval, c.timing.periodicInterval)
+          : c.timing.interval) * 1000,
         Math.min(300000, 5000 * 2 ** Math.min(failures - 1, 6)),
         e instanceof FetchError ? e.retryAfter : 0,
       );
@@ -142,7 +226,7 @@ export class StockService {
       state.missing = {};
       this.store.set('engine', state);
       if (failures === 3) this.report(`店铺连续 3 次检查失败，已退避重试。\n${message}`);
-      return `检查失败：${message}`;
+      return { ok: false, message: `检查失败：${message}` };
     } finally {
       this.scanning = false;
     }
@@ -181,6 +265,7 @@ export class StockService {
       const attempted = new Set<string>();
       const deliveries: Promise<void>[] = [];
       for (const job of this.store.dueJobs(now)) {
+        const periodic = job.dedupe.startsWith('periodic:');
         if (
           attempted.has(job.target) ||
           (this.lastTargetSend.get(job.target) ?? 0) > now - 1100 ||
@@ -190,9 +275,12 @@ export class StockService {
         if (
           !job.dedupe.startsWith('system:') &&
           !job.dedupe.startsWith('emoji-fallback:') &&
-          (!enabled.has(job.target) || !config.notifications || config.paused)
+          (!enabled.has(job.target) ||
+            !(periodic ? config.periodicNotifications : config.notifications) ||
+            config.paused)
         ) {
-          if (!enabled.has(job.target)) this.store.updateJob(job.id, 'cancelled', job.attempts, 0);
+          if (!enabled.has(job.target) || periodic)
+            this.store.updateJob(job.id, 'cancelled', job.attempts, 0);
           continue;
         }
         attempted.add(job.target);
@@ -351,10 +439,17 @@ export class StockService {
     try {
       const c = this.store.config(),
         rt = this.runtime();
+      const periodic = this.syncPeriodic(c),
+        periodicDue = periodic !== null && Date.now() >= periodic.nextAt;
       const due = rt.failures
         ? rt.nextCheck
         : Math.min(rt.nextCheck, rt.lastAttempt + c.timing.interval * 1000);
-      if (!c.paused && c.siteUrl && Date.now() >= due && !this.scanning)
+      if (
+        !c.paused &&
+        c.siteUrl &&
+        (Date.now() >= due || (periodicDue && !rt.failures)) &&
+        !this.scanning
+      )
         void this.check().catch(() => {});
       this.store.transaction(() => this.flush());
       void this.sendDue().catch((e) => this.store.set('service-error', String(e)));

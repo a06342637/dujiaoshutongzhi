@@ -474,6 +474,25 @@ export function renderBoard(
     pages,
   };
 }
+export function renderPeriodicNotification(
+  c: Config,
+  products: Product[],
+  site: string,
+  currency: string,
+  at: number,
+): MessagePayload[] {
+  // There are no change events in a periodic snapshot. The "changed" filter would hide every button.
+  const config = {
+    ...c,
+    appearance: {
+      ...c.appearance,
+      filter: c.appearance.filter === 'changed' ? ('all' as const) : c.appearance.filter,
+    },
+  };
+  const messages = renderNotification(config, products, [], site, currency, at);
+  messages[0]!.text = `<b>🕒 定时库存通知</b>\n\n${messages[0]!.text}`;
+  return messages;
+}
 export function plainFallback(p: MessagePayload): MessagePayload {
   return {
     ...p,

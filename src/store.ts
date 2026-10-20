@@ -89,8 +89,8 @@ export class Store {
     const rows = this.db
       .prepare(
         `SELECT * FROM (
-      SELECT *, CASE WHEN dedupe LIKE 'system:%' OR dedupe LIKE 'emoji-fallback:%' THEN 1 ELSE 0 END AS urgent,
-      ROW_NUMBER() OVER (PARTITION BY target, CASE WHEN dedupe LIKE 'system:%' OR dedupe LIKE 'emoji-fallback:%' THEN 1 ELSE 0 END ORDER BY id) AS position
+      SELECT *, CASE WHEN dedupe LIKE 'system:%' OR dedupe LIKE 'emoji-fallback:%' THEN 2 WHEN dedupe LIKE 'periodic:%' THEN 1 ELSE 0 END AS urgent,
+      ROW_NUMBER() OVER (PARTITION BY target, CASE WHEN dedupe LIKE 'system:%' OR dedupe LIKE 'emoji-fallback:%' THEN 2 WHEN dedupe LIKE 'periodic:%' THEN 1 ELSE 0 END ORDER BY id) AS position
       FROM jobs WHERE status='pending') WHERE position=1 AND next_attempt<=? ORDER BY urgent DESC,id LIMIT 100`,
       )
       .all(now) as Record<string, unknown>[];
@@ -119,6 +119,20 @@ export class Store {
     this.db
       .prepare("UPDATE jobs SET status='cancelled' WHERE target=? AND status='pending'")
       .run(target);
+  }
+  cancelPendingPeriodic(target?: string) {
+    if (target !== undefined)
+      this.db
+        .prepare(
+          "UPDATE jobs SET status='cancelled' WHERE status='pending' AND dedupe LIKE 'periodic:%' AND target=?",
+        )
+        .run(target);
+    else
+      this.db
+        .prepare(
+          "UPDATE jobs SET status='cancelled' WHERE status='pending' AND dedupe LIKE 'periodic:%'",
+        )
+        .run();
   }
   prune() {
     this.db

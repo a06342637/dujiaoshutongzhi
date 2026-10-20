@@ -10,6 +10,7 @@ import type { MessagePayload } from '../src/types.js';
 import { defaults } from '../src/config.js';
 import { product, scan } from './fixtures.js';
 import { VERSION } from '../src/version.js';
+import { INVENTORY_COPY_FOOTER } from '../src/inventory-copy.js';
 import { sortedProducts, renderBoard, renderNotification } from '../src/render.js';
 
 function fixture(apiReply?: (method: string, payload: any) => any) {
@@ -146,6 +147,104 @@ test('numeric menus validate, retry input, default and cancel without restart', 
     await f.click('number:timeout');
     await f.input('/cancel');
     assert.equal(f.store.get('pending', null), null);
+  } finally {
+    f.store.close();
+  }
+});
+test('periodic toggle and numeric interval are available in monitoring settings', async () => {
+  const f = fixture();
+  try {
+    await f.click('timing');
+    assert.ok(
+      JSON.stringify(f.calls.at(-1)!.payload.reply_markup).includes(
+        'toggle:periodicNotifications:timing',
+      ),
+    );
+    await f.click('number:periodicInterval');
+    await f.input('600');
+    assert.equal(f.store.config().timing.periodicInterval, 600);
+    assert.equal(f.store.config().periodicNotifications, false);
+    await f.click('toggle:periodicNotifications:timing');
+    assert.equal(f.store.config().periodicNotifications, true);
+    await f.click('number:periodicInterval');
+    await f.input('30');
+    assert.equal(f.store.config().timing.periodicInterval, 600);
+    assert.ok(f.store.get('pending', null));
+    await f.input('/cancel');
+    await f.click('toggle:notifications');
+    assert.equal(f.store.config().notifications, false);
+    assert.equal(f.store.config().periodicNotifications, true);
+  } finally {
+    f.store.close();
+  }
+});
+test('home copy inventory refreshes data and sends clipboard text with exact footer to the admin only', async () => {
+  const f = fixture();
+  try {
+    const c = f.store.config();
+    c.paused = true;
+    f.store.saveConfig(c);
+    f.service.adapter.scan = async () => scan([product(7), product(0, '2')]);
+    await f.input('/start');
+    assert.ok(JSON.stringify(f.calls.at(-1)!.payload.reply_markup).includes('copy-stock'));
+    await f.click('copy-stock', 2);
+    assert.ok(!f.calls.some((c) => c.payload.reply_markup?.inline_keyboard?.[0]?.[0]?.copy_text));
+    await f.click('copy-stock');
+    const copied = f.calls.find((c) => c.payload.reply_markup?.inline_keyboard?.[0]?.[0]?.copy_text)
+      ?.payload.reply_markup.inline_keyboard[0][0].copy_text.text;
+    assert.ok(copied.includes('库存：7'));
+    assert.ok(!copied.includes('商品 2'));
+    assert.ok(copied.endsWith(INVENTORY_COPY_FOOTER));
+    assert.equal(f.store.config().paused, true);
+  } finally {
+    f.store.close();
+  }
+});
+test('large inventory copy uses safe code blocks without exceeding Telegram clipboard limits', async () => {
+  const f = fixture();
+  try {
+    f.service.adapter.scan = async () =>
+      scan(
+        Array.from({ length: 10 }, (_, i) => ({
+          ...product(9, String(i + 1)),
+          name: `商品 <${i}> ` + '长名称'.repeat(12),
+        })),
+      );
+    await f.click('copy-stock');
+    const content = f.calls.filter(
+      (c) => c.method === 'sendMessage' && String(c.payload.text).startsWith('<pre>'),
+    );
+    assert.ok(content.length > 0);
+    assert.ok(content[0]!.payload.text.includes('&lt;0&gt;'));
+    for (const call of content) {
+      assert.ok(call.payload.text.length < 4096);
+      assert.ok(!call.payload.reply_markup?.inline_keyboard?.[0]?.[0]?.copy_text);
+    }
+  } finally {
+    f.store.close();
+  }
+});
+test('very long inventory copy includes a complete text attachment', async () => {
+  const f = fixture();
+  try {
+    f.service.adapter.scan = async () =>
+      scan(
+        Array.from({ length: 70 }, (_, i) => ({
+          ...product(9, String(i + 1)),
+          name: `商品 ${i} ` + '完整名称'.repeat(20),
+        })),
+      );
+    await f.click('copy-stock');
+    assert.ok(
+      f.calls.filter(
+        (c) => c.method === 'sendMessage' && String(c.payload.text).startsWith('<pre>'),
+      ).length > 1,
+    );
+    assert.ok(
+      f.calls.some(
+        (c) => c.method === 'sendDocument' && String(c.payload.caption).includes('完整库存文案'),
+      ),
+    );
   } finally {
     f.store.close();
   }

@@ -1,6 +1,6 @@
 {
   "name": "dujiao-stock-bot",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "type": "module",
   "description": "Dujiao-Next 库存通知：全部通过 Telegram 配置",

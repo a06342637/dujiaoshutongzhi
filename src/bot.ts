@@ -18,12 +18,14 @@ import {
   renderNotification,
   stockText,
   validateAppearance,
+  splitHTML,
 } from './render.js';
 import type { StockService } from './service.js';
 import { VERSION, REPOSITORY_URL } from './version.js';
 import type { UpdateManager } from './updater.js';
 import { normalizeTarget, targetError, TARGET_INPUT_HELP } from './targets.js';
 import { orderProducts, movedProductOrder, moveDirections, type MoveDirection } from './sorting.js';
+import { inventoryCopyText } from './inventory-copy.js';
 
 type Pending = { kind: string; args: string[]; back: string; expires: number };
 type Draft = {
@@ -221,6 +223,7 @@ export class AdminBot {
           [cb('🎨 按钮样式', 'buttons'), cb('📊 库存看板', 'boards')],
           [cb('🛠 运行状态', 'status'), cb('💾 备份与恢复', 'backup')],
           [cb('⚙️ 设置／版本更新', 'settings')],
+          [cb('📋 复制库存', 'copy-stock')],
           [cb(c.paused ? '▶ 恢复监测' : '⏸ 暂停监测', 'toggle:paused'), cb('🔎 立即检查', 'check')],
           ...(draft
             ? [[cb('👁 预览草稿', 'preview:notification'), cb('💾 保存草稿', 'draft:save')]]
@@ -255,8 +258,14 @@ export class AdminBot {
     if (name === 'timing')
       return this.show(
         ctx,
-        `<b>⏱ 监测速度与稳定性</b>\n当前 ${rt.pages} 页，商品请求约 ${rt.pages ? Math.ceil((rt.pages * 60) / c.timing.interval) : 0} 次/分钟，另每 5 分钟读取配置和分类。\n通知延迟还包括请求耗时、${c.timing.confirmations} 次确认和 ${c.timing.mergeWindow} 秒合并。\n同一轮不会重叠；低间隔增加网站负载。`,
+        `<b>⏱ 监测速度与稳定性</b>\n当前 ${rt.pages} 页，商品请求约 ${rt.pages ? Math.ceil((rt.pages * 60) / Math.min(c.timing.interval, c.periodicNotifications ? c.timing.periodicInterval : Infinity)) : 0} 次/分钟，另每 5 分钟读取配置和分类。\n变化通知延迟还包括请求耗时、${c.timing.confirmations} 次确认和 ${c.timing.mergeWindow} 秒合并。\n定时通知：${c.periodicNotifications ? `开启，每 ${c.timing.periodicInterval} 秒发送库存，无变化也发` : '关闭'}。开启或修改间隔后重新计时。\n同一轮不会重叠；网站故障或 Telegram 限流会延迟发送。`,
         [
+          [
+            cb(
+              `${onoff(c.periodicNotifications)} 定时库存通知`,
+              'toggle:periodicNotifications:timing',
+            ),
+          ],
           ...Object.entries(numericFields).map(([k, v]) => [
             cb(`${v.label}：${c.timing[k as keyof typeof numericFields]}`, `number:${k}`),
           ]),
@@ -269,6 +278,10 @@ export class AdminBot {
         [
           cb(`${onoff(c.notifications)} 变化通知`, 'toggle:notifications'),
           cb(`${onoff(c.board)} 库存看板`, 'toggle:board'),
+        ],
+        [
+          cb(`${onoff(c.periodicNotifications)} 定时库存通知`, 'toggle:periodicNotifications'),
+          cb('设置定时间隔', 'number:periodicInterval'),
         ],
         [cb(`${onoff(c.autoMonitorNew)} 自动监测新商品`, 'toggle:autoMonitorNew')],
         ...eventNames.map((k) => [cb(`${onoff(c.events[k])} ${eventLabels[k]}`, `event:${k}`)]),
@@ -603,9 +616,9 @@ export class AdminBot {
         ? '请先在“网站连接”中接入店铺。'
         : c.paused
           ? '当前全局监测已暂停，请在主菜单恢复监测。'
-          : !c.notifications && !c.board
+          : !c.notifications && !c.board && !c.periodicNotifications
             ? '当前通知和看板均已关闭，请在通知规则中开启。'
-            : `后续${c.notifications ? '库存变化会推送到此目标' : ''}${c.notifications && c.board ? '，' : ''}${c.board ? '库存看板会自动创建或更新' : ''}。`;
+            : `此目标将接收：${[c.notifications ? '库存变化通知' : '', c.periodicNotifications ? '定时库存通知' : '', c.board ? '库存看板' : ''].filter(Boolean).join('、')}。`;
       await ctx.reply(`已绑定并启用：${title}\n目标 ID：${chat.id}\n${note}`, {
         reply_markup: { remove_keyboard: true },
       });
@@ -634,6 +647,33 @@ export class AdminBot {
     const parts = data.split(':'),
       [action, a, b] = parts;
     const c = this.config();
+    if (action === 'copy-stock') {
+      await ctx.reply('正在读取当前库存，生成后可长按文案或使用代码块的复制按钮复制。');
+      const snapshot = await this.service.freshInventory();
+      const content = inventoryCopyText(snapshot.products, this.config(), snapshot.currency);
+      if (!content) {
+        await ctx.reply('当前没有有货商品。');
+        return;
+      }
+      const parts = splitHTML(`<pre>${escapeHTML(content)}</pre>`);
+      for (const text of parts)
+        await ctx.reply(text, {
+          parse_mode: 'HTML',
+          ...(content.length <= 256
+            ? {
+                reply_markup: {
+                  inline_keyboard: [[{ text: '📋 一键复制', copy_text: { text: content } }]],
+                },
+              }
+            : {}),
+        });
+      if (parts.length > 1)
+        await ctx.replyWithDocument(
+          new InputFile(Buffer.from(content, 'utf8'), '当前有货商品.txt'),
+          { caption: '完整库存文案（UTF-8），可下载后一次复制全部。' },
+        );
+      return;
+    }
     if (action === 'update') {
       if (!this.updates) throw new Error('更新服务未启用，请使用新版 Docker 镜像或 npm start');
       if (a === 'check') {
@@ -677,12 +717,24 @@ export class AdminBot {
       return this.menu(ctx, 'status');
     }
     if (action === 'toggle') {
-      if (!['paused', 'notifications', 'board', 'autoMonitorNew'].includes(a!))
+      if (
+        !['paused', 'notifications', 'periodicNotifications', 'board', 'autoMonitorNew'].includes(
+          a!,
+        )
+      )
         throw new Error('无效设置');
-      const key = a as 'paused' | 'notifications' | 'board' | 'autoMonitorNew';
+      const key = a as
+        'paused' | 'notifications' | 'periodicNotifications' | 'board' | 'autoMonitorNew';
       c[key] = !c[key];
       this.save(c);
-      return this.menu(ctx, key === 'paused' ? 'home' : 'rules');
+      return this.menu(
+        ctx,
+        key === 'paused'
+          ? 'home'
+          : key === 'periodicNotifications' && b === 'timing'
+            ? 'timing'
+            : 'rules',
+      );
     }
     if (action === 'number') {
       const key = a as keyof typeof numericFields,
@@ -693,7 +745,7 @@ export class AdminBot {
         'number',
         [key],
         'timing',
-        `输入${v.label}：${v.min}～${v.max}\n当前 ${c.timing[key]}，默认 ${v.default}。输入 default 恢复此项。`,
+        `输入${v.label}：${v.min}～${v.max}\n当前 ${c.timing[key]}，默认 ${v.default}。输入 default 恢复此项。${key === 'periodicInterval' ? '\n例如 600 = 10 分钟，3600 = 1 小时。请另行开启“定时库存通知”；它与变化通知独立，修改间隔后重新计时。' : ''}`,
       );
     }
     if (action === 'event') {
@@ -1060,6 +1112,7 @@ export class AdminBot {
             'draft',
             'pending',
             'runtime',
+            'periodic-schedule',
             'import',
           ])
             this.store.delete(key);

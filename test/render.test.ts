@@ -6,6 +6,7 @@ import {
   productButtons,
   renderBoard,
   renderNotification,
+  renderPeriodicNotification,
   splitHTML,
   validateAppearance,
   validateHTML,
@@ -123,4 +124,16 @@ test('board template overflow rejected and notifications preserve configurable c
   c.appearance.board.footer = '尾'.repeat(1000);
   assert.throws(() => renderBoard(c, [product()], '店铺', 'USD', 1, 0), /过长/);
   assert.match(productButtons([product()], defaults(), 'USD')[0]![0]!.text, /US\$|\$/);
+});
+test('periodic notices include inventory even when the notification button filter is changed-only', () => {
+  const c = defaults();
+  c.siteUrl = 'https://shop.example';
+  c.appearance.filter = 'changed';
+  c.appearance.notification.top = '欢迎选购';
+  const result = renderPeriodicNotification(c, [product(5)], '店铺', 'CNY', Date.now());
+  assert.ok(result[0]!.text.includes('定时库存通知'));
+  assert.ok(result[0]!.text.includes('欢迎选购'));
+  assert.ok(!result[0]!.text.includes('恢复有货'));
+  assert.equal(result[0]!.reply_markup.inline_keyboard.flat().filter((b) => b.url).length, 1);
+  assert.equal(c.appearance.filter, 'changed');
 });
