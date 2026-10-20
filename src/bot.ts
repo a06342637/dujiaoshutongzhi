@@ -22,6 +22,8 @@ import {
 import type { StockService } from './service.js';
 import { VERSION, REPOSITORY_URL } from './version.js';
 import type { UpdateManager } from './updater.js';
+import { normalizeTarget, targetError, TARGET_INPUT_HELP } from './targets.js';
+import { orderProducts, movedProductOrder, moveDirections, type MoveDirection } from './sorting.js';
 
 type Pending = { kind: string; args: string[]; back: string; expires: number };
 type Draft = {
@@ -154,6 +156,12 @@ export class AdminBot {
       [cb('取消', `cancel:${back}`)],
     ]);
   }
+  private async targetInput(ctx: Context) {
+    this.setPending('target', [], 'targets');
+    await ctx.reply(`${TARGET_INPUT_HELP}\n\n发送 /cancel 取消，输入将在 30 分钟后过期。`, {
+      reply_markup: { remove_keyboard: true },
+    });
+  }
   private previewData(c: Config) {
     const rt = this.service.runtime();
     const products = this.service.products();
@@ -268,11 +276,14 @@ export class AdminBot {
       ]);
     if (name === 'products') {
       const filters = this.store.get<Filters>('filters', { search: '', category: '' });
-      const all = this.service.products();
+      const edited = this.edited();
+      const all = orderProducts(this.service.products(), edited);
       const list = all.filter(
         (p) =>
           (!filters.search ||
-            `${p.name} ${p.id}`.toLowerCase().includes(filters.search.toLowerCase())) &&
+            `${edited.products[p.id]?.name || p.name} ${p.name} ${p.id}`
+              .toLowerCase()
+              .includes(filters.search.toLowerCase())) &&
           (!filters.category || p.categoryId === filters.category),
       );
       const page = Math.min(
@@ -283,7 +294,7 @@ export class AdminBot {
         .slice(page * 8, page * 8 + 8)
         .map((p) => [
           cb(
-            `${onoff(isEnabled(c, p.id))} ${p.name.slice(0, 32)} · ${stockText(p.stock)}`,
+            `${onoff(isEnabled(c, p.id))} ${(edited.products[p.id]?.name || p.name).slice(0, 32)} · ${stockText(p.stock)}`,
             `product:${p.id}`,
           ),
         ]);
@@ -293,6 +304,7 @@ export class AdminBot {
         cb('清除筛选', 'filter:clear'),
       ]);
       rows.push([cb('启用筛选结果', 'bulk:on'), cb('暂停筛选结果', 'bulk:off')]);
+      rows.push([cb('↕️ 调整商品顺序', 'sort:0'), cb('💾 保存草稿', 'draft:save')]);
       rows.push(
         [
           cb('◀', `products:${Math.max(0, page - 1)}`),
@@ -303,8 +315,35 @@ export class AdminBot {
       );
       return this.show(
         ctx,
-        `<b>📦 商品管理</b>\n共 ${list.length} 件；搜索：${escapeHTML(filters.search || '全部')}\n启停立即生效，外观修改先保存草稿。`,
+        `<b>📦 商品管理</b>\n共 ${list.length} 件；搜索：${escapeHTML(filters.search || '全部')}\n列表按当前排序草稿显示；排序与外观修改保存后同步通知和看板。启停立即生效。`,
         rows,
+      );
+    }
+    if (name === 'sort') {
+      const edited = this.edited(),
+        list = orderProducts(this.service.products(), edited);
+      const pages = Math.max(1, Math.ceil(list.length / 8)),
+        page = Math.min(pages - 1, Math.max(0, Math.trunc(Number(a) || 0)));
+      return this.show(
+        ctx,
+        '<b>↕️ 商品排序</b>\n这是全店顺序，包含暂停监测的商品。点选商品后可上移、下移、置顶或置底，也可填写排序值（小的在前）。\n修改先进入草稿，保存后同步通知购买按钮和库存看板。',
+        [
+          ...list
+            .slice(page * 8, page * 8 + 8)
+            .map((p, i) => [
+              cb(
+                `${page * 8 + i + 1}. ${(edited.products[p.id]?.name || p.name).slice(0, 32)}`,
+                `product:${p.id}`,
+              ),
+            ]),
+          [
+            cb('◀', `sort:${Math.max(0, page - 1)}`),
+            cb(`${page + 1}/${pages}`, 'noop'),
+            cb('▶', `sort:${Math.min(pages - 1, page + 1)}`),
+          ],
+          [cb('💾 保存排序草稿', 'draft:save'), cb('丢弃草稿', 'draft:discard')],
+          [cb('返回商品', 'products:0')],
+        ],
       );
     }
     if (name === 'categories') {
@@ -330,18 +369,26 @@ export class AdminBot {
       const p = this.service.products().find((x) => x.id === a);
       if (!p) return this.show(ctx, '商品暂不可见。', [[cb('返回', 'products:0')]]);
       const e = this.edited().products[p.id] ?? {};
+      const sortIndex = orderProducts(this.service.products(), this.edited()).findIndex(
+        (item) => item.id === p.id,
+      );
       return this.show(
         ctx,
-        `<b>${escapeHTML(e.name || p.name)}</b>\nID：${p.id} · ${escapeHTML(stockText(p.stock))}\n${escapeHTML(p.categoryName)}\n图标：${escapeHTML(e.emoji ?? c.appearance.emoji)}；自定义 ID：${escapeHTML(e.customEmojiId ?? '继承')}\n颜色：${styleNames[e.style ?? c.appearance.style]}；排序：${e.order ?? 0}`,
+        `<b>${escapeHTML(e.name || p.name)}</b>\nID：${p.id} · ${escapeHTML(stockText(p.stock))}\n${escapeHTML(p.categoryName)}\n图标：${escapeHTML(e.emoji ?? c.appearance.emoji)}；自定义 ID：${escapeHTML(e.customEmojiId ?? '继承')}\n颜色：${styleNames[e.style ?? c.appearance.style]}；排序值：${e.order ?? 0}\n全店位置：第 ${sortIndex + 1} 位（草稿）；保存后生效。`,
         [
           [cb(`${onoff(isEnabled(c, p.id))} 监测此商品`, `product-toggle:${p.id}`)],
           [cb('显示名称', `pinput:${p.id}:name`), cb('普通表情', `pinput:${p.id}:emoji`)],
           [cb('自定义表情／ID', `pinput:${p.id}:customEmojiId`), cb('按钮颜色', `pstyle:${p.id}`)],
           [cb('排序数字', `pinput:${p.id}:order`), cb('购买链接', `pinput:${p.id}:url`)],
+          [cb('⬆️ 上移', `pmove:${p.id}:up`), cb('⬇️ 下移', `pmove:${p.id}:down`)],
+          [cb('⏫ 置顶', `pmove:${p.id}:top`), cb('⏬ 置底', `pmove:${p.id}:bottom`)],
           [cb(`${onoff(e.expandSkus ?? false)} 展开规格按钮`, `expand:${p.id}`)],
           [cb('独立通知规则', `prules:${p.id}`), cb('恢复外观继承', `pinherit:${p.id}`)],
           [cb('👁 预览', 'preview:notification'), cb('💾 保存草稿', 'draft:save')],
-          [cb('返回商品', 'products:0')],
+          [
+            cb('返回商品', 'products:0'),
+            cb('查看排序列表', `sort:${Math.floor(Math.max(0, sortIndex) / 8)}`),
+          ],
         ],
       );
     }
@@ -452,9 +499,9 @@ export class AdminBot {
     if (name === 'targets')
       return this.show(
         ctx,
-        '<b>📣 通知目标</b>\n可选择频道／群，或输入 ID、@频道用户名。Bot 必须在目标内并具有发送权限。',
+        '<b>📣 通知目标</b>\n直接输入频道／群组用户名，例如 my_shop（不用加 @）。也支持 @用户名、t.me 公开链接或数字 ID。\n先把机器人加入目标并设为管理员；频道还需允许发布消息。绑定后启用该目标，按当前监测设置推送。',
         [
-          [cb('➕ 选择频道或群', 'target-picker'), cb('➕ 输入 ID／用户名', 'input:target')],
+          [cb('➕ 输入频道／群用户名', 'input:target')],
           [cb('➕ 管理员私聊', 'target-admin')],
           ...c.targets.map((t) => [cb(`${onoff(t.enabled)} ${t.title}`, `target:${t.id}`)]),
           homeRow,
@@ -538,33 +585,50 @@ export class AdminBot {
       );
     throw new Error('菜单已过期，请发送 /start');
   }
-  private async bind(_ctx: Context, id: string) {
-    const chat = await this.bot.api.getChat(id);
-    if (chat.type === 'private' && String(chat.id) !== this.service.adminId)
-      throw new Error('只允许绑定管理员私聊');
-    if (chat.type !== 'private') await this.rights(String(chat.id));
-    const c = this.config();
-    if (c.targets.some((t) => t.id === String(chat.id))) return;
-    const title = ('title' in chat ? chat.title : chat.first_name) || String(chat.id);
-    c.targets.push({ id: String(chat.id), title, enabled: true });
-    this.save(c);
+  private async bind(ctx: Context, input: string) {
+    try {
+      const chat = await this.bot.api.getChat(normalizeTarget(input));
+      if (chat.type === 'private' && String(chat.id) !== this.service.adminId)
+        throw new Error('该目标是个人账号，只允许绑定管理员自己的私聊；请填写频道或群组用户名。');
+      if (chat.type !== 'private') await this.rights(String(chat.id));
+      const c = this.config();
+      const title = ('title' in chat ? chat.title : chat.first_name) || String(chat.id);
+      const target = c.targets.find((t) => t.id === String(chat.id));
+      if (target) {
+        target.title = title;
+        target.enabled = true;
+      } else c.targets.push({ id: String(chat.id), title, enabled: true });
+      this.save(c);
+      const note = !c.siteUrl
+        ? '请先在“网站连接”中接入店铺。'
+        : c.paused
+          ? '当前全局监测已暂停，请在主菜单恢复监测。'
+          : !c.notifications && !c.board
+            ? '当前通知和看板均已关闭，请在通知规则中开启。'
+            : `后续${c.notifications ? '库存变化会推送到此目标' : ''}${c.notifications && c.board ? '，' : ''}${c.board ? '库存看板会自动创建或更新' : ''}。`;
+      await ctx.reply(`已绑定并启用：${title}\n目标 ID：${chat.id}\n${note}`, {
+        reply_markup: { remove_keyboard: true },
+      });
+    } catch (e) {
+      throw targetError(e);
+    }
   }
   private async rights(id: string) {
     if (id === this.service.adminId) return;
-    const chat = await this.bot.api.getChat(id),
-      member = await this.bot.api.getChatMember(id, this.bot.botInfo.id);
-    if (member.status === 'left' || member.status === 'kicked')
-      throw new Error('Bot 尚未加入此目标');
-    if (chat.type === 'channel' && (member.status !== 'administrator' || !member.can_post_messages))
-      throw new Error('频道需将 Bot 设为管理员并允许发布消息');
-    if (member.status === 'restricted' && (!member.is_member || !member.can_send_messages))
-      throw new Error('Bot 在此群没有发送权限');
-    if (
-      (chat.type === 'group' || chat.type === 'supergroup') &&
-      member.status === 'member' &&
-      chat.permissions?.can_send_messages === false
-    )
-      throw new Error('群默认权限不允许 Bot 发送消息，请授予权限');
+    try {
+      const chat = await this.bot.api.getChat(id),
+        member = await this.bot.api.getChatMember(id, this.bot.botInfo.id);
+      if (member.status === 'left' || member.status === 'kicked')
+        throw new Error('机器人尚未加入此目标，请先加入并设为管理员。');
+      if (member.status !== 'administrator' && member.status !== 'creator')
+        throw new Error('请先将机器人设为该频道／群的管理员，再重新绑定。');
+      if (chat.type === 'channel' && member.status === 'administrator' && !member.can_post_messages)
+        throw new Error(
+          '机器人已是频道管理员，但未允许发布消息。请在频道管理员权限中开启“发布消息”。',
+        );
+    } catch (e) {
+      throw targetError(e);
+    }
   }
   private async onCallback(ctx: Context, data: string) {
     const parts = data.split(':'),
@@ -639,11 +703,11 @@ export class AdminBot {
       return this.menu(ctx, 'rules');
     }
     if (action === 'input') {
+      if (a === 'target') return this.targetInput(ctx);
       const prompts: Record<string, string> = {
         site: '发送店铺完整网址，如 https://shop.example.com。更换网站会重建基线。',
         api: '发送完整 API 基址，如 https://api.example.com/api/v1。输入 - 恢复同源 API。',
         search: '发送商品名称或 ID 关键词。',
-        target: '发送目标数字 ID（频道通常以 -100 开头）或 @频道用户名。',
         import: '发送配置 JSON 文件（最大 1MB），或粘贴完整 JSON。',
       };
       if (!prompts[a!]) throw new Error('无效输入');
@@ -673,9 +737,13 @@ export class AdminBot {
     }
     if (action === 'bulk') {
       const f = this.store.get<Filters>('filters', { search: '', category: '' });
+      const edited = this.edited();
       for (const p of this.service.products())
         if (
-          (!f.search || `${p.name} ${p.id}`.toLowerCase().includes(f.search.toLowerCase())) &&
+          (!f.search ||
+            `${edited.products[p.id]?.name || p.name} ${p.name} ${p.id}`
+              .toLowerCase()
+              .includes(f.search.toLowerCase())) &&
           (!f.category || p.categoryId === f.category)
         )
           c.products[p.id] = { ...c.products[p.id], enabled: a === 'on' };
@@ -695,8 +763,28 @@ export class AdminBot {
         'product',
         [a!, b!],
         `product:${a}`,
-        `设置${visualLabels[b as (typeof visualKeys)[number]]}。自定义表情可以直接发送表情或数字 ID。\n输入 inherit 恢复继承；输入 - 清空表情或名称。`,
+        b === 'order'
+          ? '输入排序值（-100000～100000 的整数），数字越小越靠前；同值按原商品名称排序。\n输入 inherit 恢复默认。修改先进入草稿，保存后生效。'
+          : `设置${visualLabels[b as (typeof visualKeys)[number]]}。自定义表情可以直接发送表情或数字 ID。\n输入 inherit 恢复继承；输入 - 清空表情或名称。`,
       );
+    }
+    if (action === 'pmove') {
+      if (!moveDirections.includes(b as MoveDirection) || !a) throw new Error('无效的排序操作。');
+      const order = movedProductOrder(
+        this.service.products(),
+        this.edited(),
+        a,
+        b as MoveDirection,
+      );
+      if (order) {
+        const draft = this.draft();
+        order.forEach((id, index) => {
+          draft.products[id] ??= {};
+          draft.products[id]!.order = index;
+        });
+        this.store.set('draft', draft);
+      }
+      return this.menu(ctx, `product:${a}`);
     }
     if (action === 'pstyle') {
       const current = this.edited().products[a!]?.style ?? 'auto';
@@ -862,51 +950,8 @@ export class AdminBot {
       ]);
     }
     if (action === 'target-picker') {
-      await ctx.reply('选择你管理的频道或群。若列表中没有目标，可返回菜单输入 ID。', {
-        reply_markup: {
-          keyboard: [
-            [
-              {
-                text: '选择频道',
-                request_chat: {
-                  request_id: 1,
-                  chat_is_channel: true,
-                  bot_administrator_rights: {
-                    is_anonymous: false,
-                    can_manage_chat: true,
-                    can_delete_messages: false,
-                    can_manage_video_chats: false,
-                    can_restrict_members: false,
-                    can_promote_members: false,
-                    can_change_info: false,
-                    can_invite_users: false,
-                    can_post_stories: false,
-                    can_edit_stories: false,
-                    can_delete_stories: false,
-                    can_post_messages: true,
-                    can_send_welcome_messages: false,
-                  },
-                  request_title: true,
-                },
-              },
-            ],
-            [
-              {
-                text: '选择群',
-                request_chat: {
-                  request_id: 2,
-                  chat_is_channel: false,
-                  bot_is_member: true,
-                  request_title: true,
-                },
-              },
-            ],
-          ],
-          resize_keyboard: true,
-          one_time_keyboard: true,
-        },
-      });
-      return;
+      // Old inline menus remain clickable after an application upgrade.
+      return this.targetInput(ctx);
     }
     if (action === 'target-admin') {
       await this.bind(ctx, this.service.adminId);
@@ -914,7 +959,10 @@ export class AdminBot {
     }
     if (action === 'target-toggle') {
       const t = c.targets.find((t) => t.id === a);
-      if (t) t.enabled = !t.enabled;
+      if (t) {
+        if (!t.enabled) await this.rights(t.id);
+        t.enabled = !t.enabled;
+      }
       this.save(c);
       if (t && !t.enabled) this.store.cancelTarget(t.id);
       return this.menu(ctx, `target:${a}`);
@@ -1055,12 +1103,18 @@ export class AdminBot {
       await ctx.reply(
         `连接成功：${scan.siteName}，${scan.products.length} 个商品。已建立初始基线，不会补发历史变化。`,
       );
-    } else if (p.kind === 'target') await this.bind(ctx, value);
-    else if (p.kind === 'search') {
+    } else if (p.kind === 'target') {
+      await this.bind(ctx, value);
+      this.store.delete('pending');
+      await this.menu(ctx, 'targets');
+      return;
+    } else if (p.kind === 'search') {
       const filters = this.store.get<Filters>('filters', { search: '', category: '' });
       filters.search = value === '-' ? '' : value.slice(0, 100);
       this.store.set('filters', filters);
     } else if (p.kind === 'product') {
+      if (b === 'order' && value !== 'inherit' && !/^-?\d+$/.test(value))
+        throw new Error('排序值必须是 -100000～100000 的整数，或输入 inherit 恢复默认。');
       const val =
         value === 'inherit'
           ? null
@@ -1210,7 +1264,6 @@ export class AdminBot {
     this.bot.on('message:chat_shared', async (ctx) => {
       try {
         await this.bind(ctx, String(ctx.message.chat_shared.chat_id));
-        await ctx.reply('通知目标已绑定。', { reply_markup: { remove_keyboard: true } });
         await this.menu(ctx, 'targets');
       } catch (e) {
         await ctx.reply(this.errorMessage(e));

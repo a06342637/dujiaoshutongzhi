@@ -1,5 +1,6 @@
 import { eventLabels, isEnabled, type Config, type Format } from './config.js';
 import { isAvailable, isOut } from './engine.js';
+import { orderProducts } from './sorting.js';
 import type { Button, Change, MessagePayload, Product, Stock } from './types.js';
 
 export const escapeHTML = (s: unknown) =>
@@ -234,14 +235,10 @@ function buttonStyle(style: Config['appearance']['style'], stock: Stock): Button
   return isOut(stock) ? 'danger' : isAvailable(stock) ? 'success' : 'primary';
 }
 export function sortedProducts(products: Product[], c: Config) {
-  return products
-    .filter((p) => isEnabled(c, p.id))
-    .sort(
-      (a, b) =>
-        (c.products[a.id]?.order ?? 0) - (c.products[b.id]?.order ?? 0) ||
-        a.name.localeCompare(b.name, 'zh-CN') ||
-        a.id.localeCompare(b.id),
-    );
+  return orderProducts(
+    products.filter((p) => isEnabled(c, p.id)),
+    c,
+  );
 }
 function clip(s: string, max = 110) {
   const chars = Array.from(s);
